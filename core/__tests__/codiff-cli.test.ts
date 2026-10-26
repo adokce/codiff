@@ -941,7 +941,7 @@ test('packaged terminal helper forwards pre-authored walkthrough files', async (
       repositoryPath,
     ],
     {
-      env: logger.env,
+      env: { ...logger.env, FAKE_WALKTHROUGH_RESULT: 'ready' },
     },
   );
 
@@ -955,9 +955,35 @@ test('packaged terminal helper forwards pre-authored walkthrough files', async (
     'claude',
     '--walkthrough-file',
     walkthroughFile,
+    '--walkthrough-result-file',
+    expect.stringMatching(/codiff-walkthrough-result\.[^/]+\/result\.txt$/),
     '--walkthrough',
     repositoryPath,
   ]);
+});
+
+test('packaged terminal helper fails when the app cannot apply the walkthrough file', async () => {
+  await using logger = await createFakeOpenLogger();
+  const repositoryPath = join(logger.directory, 'repo');
+  const walkthroughFile = join(logger.directory, 'walkthrough.json');
+
+  await mkdir(repositoryPath);
+  await writeFile(walkthroughFile, '{}');
+
+  await expect(
+    execFileAsync(
+      resolve('bin/codiff-app'),
+      ['-w', '--walkthrough-file', walkthroughFile, repositoryPath],
+      {
+        env: {
+          ...logger.env,
+          FAKE_WALKTHROUGH_RESULT: 'unavailable\nUnresolved hunk ids: README.md:.1.',
+          // The app reports after the launcher starts waiting.
+          FAKE_WALKTHROUGH_RESULT_DELAY: '0.3',
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ code: 1, stderr: 'Unresolved hunk ids: README.md:.1.\n' });
 });
 
 test('packaged terminal helper forwards a plan handoff and result file', async () => {
