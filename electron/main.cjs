@@ -83,6 +83,7 @@ const { createSkillInstaller } = require('./main/agent-skill.cjs');
 const { createEditorOpener } = require('./main/editor.cjs');
 const { createDefinitionSearchCoordinator } = require('./definition-search.cjs');
 const { createTerminalHelper } = require('./main/terminal-helper.cjs');
+const { createWalkthroughLaunchController } = require('./main/walkthrough-launch.cjs');
 const { createWindowRevealController } = require('./window-reveal.cjs');
 const {
   MIN_WINDOW_HEIGHT,
@@ -1125,6 +1126,7 @@ const createWindow = (
     windowIdentities.delete(webContentsId);
     windowRevealControllers.delete(webContentsId);
     windowInitialRepositoryStates.delete(webContentsId);
+    walkthroughLaunchController.clear(webContentsId);
     walkthroughProgressGenerations.delete(webContentsId);
     windowRepositories.delete(webContentsId);
     windowLaunchOptions.delete(webContentsId);
@@ -1285,6 +1287,7 @@ const focusOrCreateWindow = (
 
   if (matchingWindow) {
     if (launchOptions.planFile || launchOptions.walkthrough || launchOptions.walkthroughFile) {
+      walkthroughLaunchController.clear(matchingWebContentsId);
       windowRepositories.set(matchingWebContentsId, identity?.repositoryRoot || repositoryPath);
       windowLaunchOptions.set(matchingWebContentsId, launchOptions);
       if (launchOptions.planFile) {
@@ -1310,70 +1313,12 @@ const focusOrCreateWindow = (
   return createWindow(repositoryPath, launchOptions, identity, preloadedRepositoryState);
 };
 
-/**
- * Why a walkthrough file cannot be applied to the diff, or null when it can.
- *
- * @param {string} walkthroughFile
- * @param {Promise<RepositoryState>} repositoryState
- */
-const checkWalkthroughFile = async (walkthroughFile, repositoryState) => {
-  let input;
-  try {
-    input = JSON.parse(readFileSync(walkthroughFile, 'utf8'));
-  } catch (error) {
-    return `Could not read walkthrough file: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  try {
-    const { files } = await repositoryState;
-    assertWalkthroughHunkIdsResolve(input, files);
-    normalizeNarrativeWalkthrough(input, files);
-    return null;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return `Walkthrough file could not be applied to this diff: ${detail}`;
-  }
-};
-
-/** Launch checks still running; `activate` must not open their window unchecked. */
-let pendingWalkthroughFileChecks = 0;
-
-/**
- * Opens a command-line launch. When a CLI waits on a walkthrough file, the file
- * is checked against the diff before any window opens: the CLI gets the result
- * either way, and a file that cannot be applied opens nothing.
- *
- * @param {string} repositoryPath
- * @param {CodiffLaunchOptions} launchOptions
- */
-const openLaunchWindow = async (repositoryPath, launchOptions) => {
-  const { walkthroughFile, walkthroughResultFile } = launchOptions;
-  if (!walkthroughFile || !walkthroughResultFile) {
-    focusOrCreateWindow(repositoryPath, launchOptions);
-    return;
-  }
-
-  pendingWalkthroughFileChecks += 1;
-  const repositoryState = readInitialRepositoryStateWithConfig(repositoryPath, launchOptions);
-  repositoryState.catch(() => {});
-  const reason = await checkWalkthroughFile(walkthroughFile, repositoryState);
-  pendingWalkthroughFileChecks -= 1;
-  try {
-    writeFileSync(
-      walkthroughResultFile,
-      // Plain text so the shell launcher can read it: the status line, then the reason.
-      reason ? `unavailable\n${reason}\n` : 'ready\n',
-      'utf8',
-    );
-  } catch {
-    // The waiting process may have been interrupted and removed its temporary result directory.
-  }
-
-  if (!reason) {
-    focusOrCreateWindow(repositoryPath, launchOptions, repositoryState);
-  } else if (BrowserWindow.getAllWindows().length === 0) {
-    app.quit();
-  }
-};
+const walkthroughLaunchController = createWalkthroughLaunchController({
+  hasWindows: () => BrowserWindow.getAllWindows().length > 0,
+  openWindow: focusOrCreateWindow,
+  quit: () => app.quit(),
+  readRepositoryState: readInitialRepositoryStateWithConfig,
+});
 
 const INITIAL_UPDATE_CHECK_DELAY_MS = 10 * 1000;
 const UPDATE_CHECK_TIMER_INTERVAL_MS = 4 * 60 * 60 * 1000;
@@ -1468,7 +1413,7 @@ if (squirrelStartup || !lock) {
     const launchPath = resolve(
       data.repositoryPath || getCommandLineRepositoryPath(commandLine) || workingDirectory,
     );
-    void openLaunchWindow(
+    void walkthroughLaunchController.open(
       getInitialRepositoryPath(launchPath, launchOptions, config.settings.lastRepositoryPath),
       launchOptions,
     );
@@ -1508,7 +1453,7 @@ if (squirrelStartup || !lock) {
     setInterval(runScheduledUpdateCheck, UPDATE_CHECK_TIMER_INTERVAL_MS);
 
     const launchOptions = getLaunchOptions();
-    void openLaunchWindow(
+    void walkthroughLaunchController.open(
       getInitialRepositoryPath(getLaunchPath(), launchOptions, config.settings.lastRepositoryPath),
       launchOptions,
     );
@@ -1549,7 +1494,7 @@ if (squirrelStartup || !lock) {
   app.on('will-quit', () => codexModelDiscoveryAbort.abort());
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0 && pendingWalkthroughFileChecks === 0) {
+    if (BrowserWindow.getAllWindows().length === 0 && !walkthroughLaunchController.hasPending()) {
       const launchOptions = getLaunchOptions();
       focusOrCreateWindow(
         getInitialRepositoryPath(
@@ -1563,7 +1508,7 @@ if (squirrelStartup || !lock) {
   });
 
   app.on('window-all-closed', () => {
-    app.quit();
+    walkthroughLaunchController.quitIfIdle();
   });
 
   app.on('before-quit', (event) => {
@@ -1614,7 +1559,15 @@ ipcMain.handle('codiff:openReleasePage', () => {
 ipcMain.handle('codiff:getRepositoryState', async (event, source) => {
   const repositoryPath = windowRepositories.get(event.sender.id) || getLaunchPath();
   const launchOptions = windowLaunchOptions.get(event.sender.id);
-  const initialState = !source ? windowInitialRepositoryStates.get(event.sender.id) : undefined;
+  const walkthroughState = walkthroughLaunchController.getInitialRepositoryState(
+    event.sender.id,
+    source,
+  );
+  const initialState = walkthroughState
+    ? Promise.resolve(walkthroughState)
+    : !source
+      ? windowInitialRepositoryStates.get(event.sender.id)
+      : undefined;
   if (initialState) {
     windowInitialRepositoryStates.delete(event.sender.id);
   }
@@ -1773,12 +1726,29 @@ ipcMain.handle('codiff:getNarrativeWalkthrough', async (event, source, options) 
   );
 
   try {
+    const agent = resolveWindowAgent(event.sender.id);
+    const initialWalkthrough = walkthroughLaunchController.takeInitialWalkthrough(
+      event.sender.id,
+      source,
+    );
+    if (initialWalkthrough) {
+      const sessionContext = await Promise.resolve(
+        agent.readSessionContext(launchOptions?.[agent.sessionLaunchOptionKey]),
+      ).catch(() => null);
+      return {
+        status: 'ready',
+        walkthrough: {
+          ...initialWalkthrough,
+          agent: agent.id,
+          ...(sessionContext ? { context: sessionContext } : {}),
+        },
+      };
+    }
     const repositoryPath = windowRepositories.get(event.sender.id) || getLaunchPath();
     const state = await readRepositoryStateWithConfig(
       repositoryPath,
       source || launchOptions?.source,
     );
-    const agent = resolveWindowAgent(event.sender.id);
     const walkthroughFile = launchOptions?.walkthroughFile;
     if (walkthroughFile) {
       let contents;
@@ -1807,6 +1777,7 @@ ipcMain.handle('codiff:getNarrativeWalkthrough', async (event, source, options) 
       }
 
       try {
+        assertWalkthroughHunkIdsResolve(input, state.files);
         return {
           status: 'ready',
           walkthrough: normalizeNarrativeWalkthrough(input, state.files, {
