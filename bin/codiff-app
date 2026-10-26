@@ -715,7 +715,10 @@ open_codiff() {
 
   # There is no `open` outside macOS, so start the packaged executable directly.
   if executable_path="$(packaged_executable_path)"; then
-    "$executable_path" "$@" </dev/null >/dev/null 2>&1 &
+    (
+      unset ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE
+      "$executable_path" "$@" </dev/null >/dev/null 2>&1
+    ) &
     return 0
   fi
 

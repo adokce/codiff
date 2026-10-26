@@ -802,6 +802,7 @@ test('packaged terminal helper forwards Codex walkthrough seed options', async (
 // helper lives at <install>/resources/app/bin/codiff-app.
 const fakePackagedExecutable = `#!/bin/sh
 printf "ELECTRON_RUN_AS_NODE=%s\n" "\${ELECTRON_RUN_AS_NODE:-}" > "$PACKAGED_ARGS_FILE.tmp"
+printf "ELECTRON_NO_ATTACH_CONSOLE=%s\n" "\${ELECTRON_NO_ATTACH_CONSOLE:-}" >> "$PACKAGED_ARGS_FILE.tmp"
 for arg in "$@"; do
   printf "%s\n" "$arg" >> "$PACKAGED_ARGS_FILE.tmp"
 done
@@ -814,8 +815,11 @@ const createPackagedInstall = async (executableName: string, executableScript: s
   const helperPath = join(binPath, 'codiff-app');
   const executablePath = join(directory.path, executableName);
   const argsPath = join(directory.path, 'args.txt');
+  const homePath = join(directory.path, 'home');
 
   await mkdir(binPath, { recursive: true });
+  await mkdir(homePath);
+  await writeFile(join(binPath, '..', 'package.json'), await readFile(resolve('package.json')));
   await writeFile(helperPath, await readFile(resolve('bin/codiff-app')));
   await chmod(helperPath, 0o755);
   await writeFile(executablePath, executableScript);
@@ -826,8 +830,15 @@ const createPackagedInstall = async (executableName: string, executableScript: s
   return {
     binPath: await realpath(binPath),
     directory: directory.path,
-    env: { ...env, PACKAGED_ARGS_FILE: argsPath },
+    env: {
+      ...env,
+      ELECTRON_NO_ATTACH_CONSOLE: undefined,
+      ELECTRON_RUN_AS_NODE: undefined,
+      HOME: homePath,
+      PACKAGED_ARGS_FILE: argsPath,
+    },
     helperPath,
+    homePath,
     // The launch is backgrounded, so wait for the fake to finish writing.
     async readArgs() {
       for (let attempt = 0; attempt < 250; attempt++) {
@@ -851,11 +862,12 @@ for (const executableName of ['codiff.exe', 'codiff']) {
     await mkdir(repositoryPath);
 
     await execFileAsync(install.helperPath, ['--commit', 'HEAD', repositoryPath], {
-      env: install.env,
+      env: { ...install.env, ELECTRON_NO_ATTACH_CONSOLE: '1', ELECTRON_RUN_AS_NODE: '1' },
     });
 
     expect(await install.readArgs()).toEqual([
       'ELECTRON_RUN_AS_NODE=',
+      'ELECTRON_NO_ATTACH_CONSOLE=',
       '--commit',
       'HEAD',
       repositoryPath,
@@ -869,12 +881,39 @@ for (const executableName of ['codiff.exe', 'codiff']) {
 
     expect(await install.readArgs()).toEqual([
       'ELECTRON_RUN_AS_NODE=1',
+      'ELECTRON_NO_ATTACH_CONSOLE=',
       join(install.binPath, 'codiff.js'),
       '--completions',
       'zsh',
     ]);
   });
 }
+
+test('packaged terminal helper launches with a cached update notice', async () => {
+  await using install = await createPackagedInstall('codiff', fakePackagedExecutable);
+  const configPath = join(install.homePath, '.codiff');
+
+  await mkdir(configPath);
+  await writeFile(
+    join(configPath, 'update-state.json'),
+    JSON.stringify({
+      compatible: true,
+      lastCheckedAt: new Date().toISOString(),
+      latestVersion: '999.0.0',
+    }),
+  );
+
+  const { stderr } = await execFileAsync(install.helperPath, [install.directory], {
+    env: install.env,
+  });
+
+  expect(stderr).toContain('-> v999.0.0');
+  expect(await install.readArgs()).toEqual([
+    'ELECTRON_RUN_AS_NODE=',
+    'ELECTRON_NO_ATTACH_CONSOLE=',
+    install.directory,
+  ]);
+});
 
 test('packaged terminal helper checks the plan app PID with tasklist in Git Bash', async () => {
   // The app reports a Windows PID that the MSYS `kill` cannot see.
